@@ -1,0 +1,312 @@
+package cacheprog
+
+import (
+	"archive/zip"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Entry struct {
+	OutputID []byte
+	Size     int64
+	Time     time.Time
+	DiskPath string
+}
+
+type pendingEntry struct {
+	actionID []byte
+	outputID []byte
+	size     int64
+	diskPath string
+}
+
+type ArchiveCache struct {
+	archivePath string
+	tmpDir      string
+
+	mu      sync.Mutex
+	zr      *zip.ReadCloser
+	entries map[string]*zip.File // populated in OpenArchive, read-only afterwards
+	pending map[string]pendingEntry
+
+	extractMu sync.Mutex
+	extracts  map[string]*extractOnce
+}
+
+type extractOnce struct {
+	once sync.Once
+	err  error
+}
+
+func OpenArchive(archivePath string) (*ArchiveCache, error) {
+	absPath, err := filepath.Abs(archivePath)
+	if err != nil {
+		return nil, err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "go-archive-cacheprog-*")
+	if err != nil {
+		return nil, err
+	}
+
+	cache := &ArchiveCache{
+		archivePath: absPath,
+		tmpDir:      tmpDir,
+		entries:     make(map[string]*zip.File),
+		pending:     make(map[string]pendingEntry),
+		extracts:    make(map[string]*extractOnce),
+	}
+
+	fi, err := os.Stat(absPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cache, nil
+		}
+		os.RemoveAll(tmpDir)
+		return nil, err
+	}
+	if fi.Size() == 0 {
+		return cache, nil
+	}
+
+	zr, err := zip.OpenReader(absPath)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, err
+	}
+	cache.zr = zr
+	for _, f := range zr.File {
+		actionHex, _, ok := strings.Cut(f.Name, "-")
+		if !ok {
+			continue
+		}
+		cache.entries[actionHex] = f
+	}
+	return cache, nil
+}
+
+func (c *ArchiveCache) Get(actionID []byte) (*Entry, error) {
+	key := hex.EncodeToString(actionID)
+
+	c.mu.Lock()
+	if p, ok := c.pending[key]; ok {
+		diskPath := p.diskPath
+		outputID := append([]byte(nil), p.outputID...)
+		size := p.size
+		c.mu.Unlock()
+
+		fi, err := os.Stat(diskPath)
+		if err != nil {
+			return nil, err
+		}
+		return &Entry{OutputID: outputID, Size: size, Time: fi.ModTime(), DiskPath: diskPath}, nil
+	}
+	f, ok := c.entries[key]
+	c.mu.Unlock()
+	if !ok {
+		return nil, nil
+	}
+
+	_, outputHex, _ := strings.Cut(f.Name, "-")
+	outputID, err := hex.DecodeString(outputHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid output id in archive entry %q: %w", f.Name, err)
+	}
+
+	diskPath := filepath.Join(c.tmpDir, "get-"+key)
+	if err := c.extract(key, f, diskPath); err != nil {
+		return nil, err
+	}
+
+	return &Entry{
+		OutputID: outputID,
+		Size:     int64(f.UncompressedSize64),
+		Time:     f.Modified,
+		DiskPath: diskPath,
+	}, nil
+}
+
+func (c *ArchiveCache) extract(key string, f *zip.File, dst string) error {
+	c.extractMu.Lock()
+	ex, ok := c.extracts[key]
+	if !ok {
+		ex = &extractOnce{}
+		c.extracts[key] = ex
+	}
+	c.extractMu.Unlock()
+
+	ex.once.Do(func() {
+		if _, err := os.Stat(dst); err == nil {
+			return
+		}
+		ex.err = extractEntry(f, dst)
+	})
+	return ex.err
+}
+
+func extractEntry(f *zip.File, dst string) (err error) {
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		closeErr := out.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			os.Remove(dst)
+		}
+	}()
+
+	_, err = io.Copy(out, rc)
+	return err
+}
+
+func (c *ArchiveCache) Put(actionID, outputID []byte, size int64, body []byte) (string, error) {
+	if int64(len(body)) != size {
+		return "", fmt.Errorf("body size mismatch: got %d, want %d", len(body), size)
+	}
+
+	key := hex.EncodeToString(actionID)
+	diskPath := filepath.Join(c.tmpDir, "put-"+key)
+	if err := os.WriteFile(diskPath, body, 0o644); err != nil {
+		return "", err
+	}
+
+	c.mu.Lock()
+	c.pending[key] = pendingEntry{
+		actionID: append([]byte(nil), actionID...),
+		outputID: append([]byte(nil), outputID...),
+		size:     size,
+		diskPath: diskPath,
+	}
+	c.mu.Unlock()
+
+	return diskPath, nil
+}
+
+func (c *ArchiveCache) Close() error {
+	flushErr := c.Flush()
+
+	c.mu.Lock()
+	if c.zr != nil {
+		c.zr.Close()
+		c.zr = nil
+	}
+	c.mu.Unlock()
+
+	rmErr := os.RemoveAll(c.tmpDir)
+
+	if flushErr != nil {
+		return flushErr
+	}
+	return rmErr
+}
+
+func (c *ArchiveCache) Flush() error {
+	c.mu.Lock()
+	pending := c.pending
+	c.pending = make(map[string]pendingEntry)
+	c.mu.Unlock()
+
+	archiveExists := true
+	if _, err := os.Stat(c.archivePath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		archiveExists = false
+	}
+	if len(pending) == 0 && archiveExists {
+		return nil
+	}
+
+	archiveDir := filepath.Dir(c.archivePath)
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp(archiveDir, ".tmp-archive-*.zip")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	zw := zip.NewWriter(tmpFile)
+
+	if c.zr != nil {
+		for _, f := range c.zr.File {
+			if actionHex, _, ok := strings.Cut(f.Name, "-"); ok {
+				if _, replace := pending[actionHex]; replace {
+					continue
+				}
+			}
+			if err := zw.Copy(f); err != nil {
+				return err
+			}
+		}
+	}
+
+	now := time.Now()
+	for _, p := range pending {
+		name := fmt.Sprintf("%s-%s", hex.EncodeToString(p.actionID), hex.EncodeToString(p.outputID))
+		header := &zip.FileHeader{Name: name, Method: zip.Deflate, Modified: now}
+		w, err := zw.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		if err := copyFile(w, p.diskPath); err != nil {
+			return err
+		}
+	}
+
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	if c.zr != nil {
+		c.zr.Close()
+		c.zr = nil
+	}
+	c.mu.Unlock()
+
+	if err := os.Rename(tmpPath, c.archivePath); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func copyFile(dst io.Writer, srcPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	_, err = io.Copy(dst, src)
+	return err
+}
