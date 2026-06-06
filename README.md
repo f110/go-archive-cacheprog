@@ -24,6 +24,18 @@ go build ./...
 
 If the file does not exist yet, it is created on the first build. If it does exist, its contents are loaded and used as the cache.
 
+### Compression
+
+The compression method for newly written entries can be selected with `GO_ARCHIVE_CACHE_COMPRESSION`:
+
+| Value     | Method     | Notes                                                                  |
+| --------- | ---------- | ---------------------------------------------------------------------- |
+| `deflate` | Deflate    | Default. Compatible with every zip tool.                               |
+| `zstd`    | Zstandard  | zip method 93. Similar ratio to deflate but several times faster. Standard zip tools cannot read these entries. |
+| `store`   | No-op      | No compression. Lowest CPU cost, largest file.                         |
+
+Entries kept from an existing archive are copied without recompression, so a single archive may contain a mix of methods. Reading transparently handles all three.
+
 ### Example: CI
 
 ```sh

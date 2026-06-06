@@ -26,13 +26,18 @@ type session struct {
 
 func newSession(t *testing.T, archivePath string) *session {
 	t.Helper()
+	return newSessionWith(t, archivePath, CompressionDeflate)
+}
+
+func newSessionWith(t *testing.T, archivePath string, method Compression) *session {
+	t.Helper()
 
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	stats := &bytes.Buffer{}
 	errCh := make(chan error, 1)
 	go func() {
-		err := Run(context.Background(), archivePath, inR, outW, stats)
+		err := Run(context.Background(), archivePath, method, inR, outW, stats)
 		outW.Close()
 		errCh <- err
 	}()
@@ -355,6 +360,88 @@ func TestServe_StatsOutput(t *testing.T) {
 	}
 	if strings.Contains(stats, "update time:") {
 		t.Fatalf("read-only session must not report update time:\n%s", stats)
+	}
+}
+
+func TestServe_ZstdRoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	archivePath := filepath.Join(tmp, "cache.zip")
+
+	actionID := []byte{0x11, 0x22}
+	outputID := []byte{0x33}
+	payload := bytes.Repeat([]byte("zstd-compressed-payload\n"), 4096)
+
+	s := newSessionWith(t, archivePath, CompressionZstd)
+	s.send(Request{ID: 1, Command: CmdPut, ActionID: actionID, OutputID: outputID, BodySize: int64(len(payload))})
+	s.send(payload)
+	if r := s.recv(); r.Err != "" {
+		t.Fatalf("put error: %s", r.Err)
+	}
+	s.closeAndWait()
+
+	if !strings.Contains(s.stats.String(), "compression:   zstd") {
+		t.Fatalf("stats should report zstd:\n%s", s.stats.String())
+	}
+
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer zr.Close()
+	if len(zr.File) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(zr.File))
+	}
+	if got := zr.File[0].Method; got != uint16(CompressionZstd) {
+		t.Fatalf("entry method = %d, want %d", got, uint16(CompressionZstd))
+	}
+
+	s2 := newSessionWith(t, archivePath, CompressionZstd)
+	s2.send(Request{ID: 1, Command: CmdGet, ActionID: actionID})
+	hit := s2.recv()
+	if hit.Miss {
+		t.Fatalf("expected hit on zstd archive")
+	}
+	got, err := os.ReadFile(hit.DiskPath)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("payload round-trip failed (err=%v): len got=%d want=%d", err, len(got), len(payload))
+	}
+	s2.closeAndWait()
+}
+
+func TestServe_MixedMethodCarryOver(t *testing.T) {
+	tmp := t.TempDir()
+	archivePath := filepath.Join(tmp, "cache.zip")
+
+	oldAction := []byte{0xaa}
+	oldPayload := []byte("entry compressed with deflate")
+	s1 := newSessionWith(t, archivePath, CompressionDeflate)
+	s1.send(Request{ID: 1, Command: CmdPut, ActionID: oldAction, OutputID: []byte{0x01}, BodySize: int64(len(oldPayload))})
+	s1.send(oldPayload)
+	s1.recv()
+	s1.closeAndWait()
+
+	newAction := []byte{0xbb}
+	newPayload := []byte("entry compressed with zstd")
+	s2 := newSessionWith(t, archivePath, CompressionZstd)
+	s2.send(Request{ID: 1, Command: CmdPut, ActionID: newAction, OutputID: []byte{0x02}, BodySize: int64(len(newPayload))})
+	s2.send(newPayload)
+	s2.recv()
+	s2.closeAndWait()
+
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer zr.Close()
+	methods := map[uint16]int{}
+	for _, f := range zr.File {
+		methods[f.Method]++
+	}
+	if methods[uint16(CompressionDeflate)] != 1 {
+		t.Fatalf("want 1 deflate entry, got methods=%v", methods)
+	}
+	if methods[uint16(CompressionZstd)] != 1 {
+		t.Fatalf("want 1 zstd entry, got methods=%v", methods)
 	}
 }
 

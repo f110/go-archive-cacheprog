@@ -31,6 +31,7 @@ type pendingEntry struct {
 type ArchiveCache struct {
 	archivePath string
 	tmpDir      string
+	method      Compression
 
 	mu      sync.Mutex
 	zr      *zip.ReadCloser
@@ -67,7 +68,7 @@ type extractOnce struct {
 	err  error
 }
 
-func OpenArchive(archivePath string) (*ArchiveCache, error) {
+func OpenArchive(archivePath string, method Compression) (*ArchiveCache, error) {
 	absPath, err := filepath.Abs(archivePath)
 	if err != nil {
 		return nil, err
@@ -81,6 +82,7 @@ func OpenArchive(archivePath string) (*ArchiveCache, error) {
 	cache := &ArchiveCache{
 		archivePath: absPath,
 		tmpDir:      tmpDir,
+		method:      method,
 		entries:     make(map[string]*zip.File),
 		pending:     make(map[string]pendingEntry),
 		extracts:    make(map[string]*extractOnce),
@@ -254,8 +256,10 @@ func (c *ArchiveCache) WriteStats(w io.Writer) error {
 
 	if _, err := fmt.Fprintf(w,
 		"go-archive-cacheprog: cache stats\n"+
-			"  archive:       %s\n",
+			"  archive:       %s\n"+
+			"  compression:   %s\n",
 		c.archivePath,
+		c.method,
 	); err != nil {
 		return err
 	}
@@ -375,7 +379,7 @@ func (c *ArchiveCache) Flush() error {
 	now := time.Now()
 	for _, p := range pending {
 		name := fmt.Sprintf("%s-%s", hex.EncodeToString(p.actionID), hex.EncodeToString(p.outputID))
-		header := &zip.FileHeader{Name: name, Method: zip.Deflate, Modified: now}
+		header := &zip.FileHeader{Name: name, Method: uint16(c.method), Modified: now}
 		w, err := zw.CreateHeader(header)
 		if err != nil {
 			return err

@@ -9,8 +9,8 @@ import (
 	"sync"
 )
 
-func Run(ctx context.Context, archivePath string, in io.Reader, out, stats io.Writer) (err error) {
-	cache, err := OpenArchive(archivePath)
+func Run(ctx context.Context, archivePath string, method Compression, in io.Reader, out, stats io.Writer) (err error) {
+	cache, err := OpenArchive(archivePath, method)
 	if err != nil {
 		return fmt.Errorf("failed to open archive %q: %w", archivePath, err)
 	}
