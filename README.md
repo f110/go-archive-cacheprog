@@ -36,6 +36,18 @@ The compression method for newly written entries can be selected with `GO_ARCHIV
 
 Entries kept from an existing archive are copied without recompression, so a single archive may contain a mix of methods. Reading transparently handles all three.
 
+### Scratch directory
+
+While the cacheprog is running, every `put` body and every `get` cache hit is materialized as a file on disk so that the `go` toolchain can read it by path. These files live in a per-process scratch directory that is removed on close.
+
+By default, the scratch directory is created under the OS temp directory (`$TMPDIR` or `/tmp`). Override the parent with `GO_ARCHIVE_CACHE_TMPDIR` to put it on a different filesystem — for example a tmpfs ramdisk or a dedicated cache volume:
+
+```sh
+export GO_ARCHIVE_CACHE_TMPDIR=/mnt/fast-scratch
+```
+
+If the directory does not exist it is created with `mkdir -p` semantics. The scratch subdirectory itself is always removed on close; only the random subdirectory under it is touched.
+
 ### Example: CI
 
 ```sh

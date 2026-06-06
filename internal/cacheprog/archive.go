@@ -68,13 +68,18 @@ type extractOnce struct {
 	err  error
 }
 
-func OpenArchive(archivePath string, method Compression) (*ArchiveCache, error) {
+func OpenArchive(archivePath string, method Compression, tmpDirParent string) (*ArchiveCache, error) {
 	absPath, err := filepath.Abs(archivePath)
 	if err != nil {
 		return nil, err
 	}
 
-	tmpDir, err := os.MkdirTemp("", "go-archive-cacheprog-*")
+	if tmpDirParent != "" {
+		if err := os.MkdirAll(tmpDirParent, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	tmpDir, err := os.MkdirTemp(tmpDirParent, "go-archive-cacheprog-*")
 	if err != nil {
 		return nil, err
 	}

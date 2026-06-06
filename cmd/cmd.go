@@ -12,6 +12,7 @@ import (
 const (
 	archiveEnvVar     = "GO_ARCHIVE_CACHE_FILE"
 	compressionEnvVar = "GO_ARCHIVE_CACHE_COMPRESSION"
+	tmpDirEnvVar      = "GO_ARCHIVE_CACHE_TMPDIR"
 )
 
 func NewRootCommand() *cobra.Command {
@@ -20,8 +21,9 @@ func NewRootCommand() *cobra.Command {
 		Short: "GOCACHEPROG implementation backed by a single zip archive file",
 		Long: fmt.Sprintf("go-archive-cacheprog implements the GOCACHEPROG protocol.\n"+
 			"The archive file path is taken from %s.\n"+
-			"The compression for new entries is taken from %s (deflate, zstd, store; default deflate).",
-			archiveEnvVar, compressionEnvVar),
+			"The compression for new entries is taken from %s (deflate, zstd, store; default deflate).\n"+
+			"The parent directory for the per-process scratch dir is taken from %s (default: OS temp dir).",
+			archiveEnvVar, compressionEnvVar, tmpDirEnvVar),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          cobra.NoArgs,
@@ -34,7 +36,8 @@ func NewRootCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("%s: %w", compressionEnvVar, err)
 			}
-			return cacheprog.Run(c.Context(), archivePath, compression, os.Stdin, os.Stdout, os.Stderr)
+			tmpDir := os.Getenv(tmpDirEnvVar)
+			return cacheprog.Run(c.Context(), archivePath, compression, tmpDir, os.Stdin, os.Stdout, os.Stderr)
 		},
 	}
 }

@@ -26,10 +26,10 @@ type session struct {
 
 func newSession(t *testing.T, archivePath string) *session {
 	t.Helper()
-	return newSessionWith(t, archivePath, CompressionDeflate)
+	return newSessionWith(t, archivePath, CompressionDeflate, "")
 }
 
-func newSessionWith(t *testing.T, archivePath string, method Compression) *session {
+func newSessionWith(t *testing.T, archivePath string, method Compression, tmpDir string) *session {
 	t.Helper()
 
 	inR, inW := io.Pipe()
@@ -37,7 +37,7 @@ func newSessionWith(t *testing.T, archivePath string, method Compression) *sessi
 	stats := &bytes.Buffer{}
 	errCh := make(chan error, 1)
 	go func() {
-		err := Run(context.Background(), archivePath, method, inR, outW, stats)
+		err := Run(context.Background(), archivePath, method, tmpDir, inR, outW, stats)
 		outW.Close()
 		errCh <- err
 	}()
@@ -371,7 +371,7 @@ func TestServe_ZstdRoundTrip(t *testing.T) {
 	outputID := []byte{0x33}
 	payload := bytes.Repeat([]byte("zstd-compressed-payload\n"), 4096)
 
-	s := newSessionWith(t, archivePath, CompressionZstd)
+	s := newSessionWith(t, archivePath, CompressionZstd, "")
 	s.send(Request{ID: 1, Command: CmdPut, ActionID: actionID, OutputID: outputID, BodySize: int64(len(payload))})
 	s.send(payload)
 	if r := s.recv(); r.Err != "" {
@@ -395,7 +395,7 @@ func TestServe_ZstdRoundTrip(t *testing.T) {
 		t.Fatalf("entry method = %d, want %d", got, uint16(CompressionZstd))
 	}
 
-	s2 := newSessionWith(t, archivePath, CompressionZstd)
+	s2 := newSessionWith(t, archivePath, CompressionZstd, "")
 	s2.send(Request{ID: 1, Command: CmdGet, ActionID: actionID})
 	hit := s2.recv()
 	if hit.Miss {
@@ -414,7 +414,7 @@ func TestServe_MixedMethodCarryOver(t *testing.T) {
 
 	oldAction := []byte{0xaa}
 	oldPayload := []byte("entry compressed with deflate")
-	s1 := newSessionWith(t, archivePath, CompressionDeflate)
+	s1 := newSessionWith(t, archivePath, CompressionDeflate, "")
 	s1.send(Request{ID: 1, Command: CmdPut, ActionID: oldAction, OutputID: []byte{0x01}, BodySize: int64(len(oldPayload))})
 	s1.send(oldPayload)
 	s1.recv()
@@ -422,7 +422,7 @@ func TestServe_MixedMethodCarryOver(t *testing.T) {
 
 	newAction := []byte{0xbb}
 	newPayload := []byte("entry compressed with zstd")
-	s2 := newSessionWith(t, archivePath, CompressionZstd)
+	s2 := newSessionWith(t, archivePath, CompressionZstd, "")
 	s2.send(Request{ID: 1, Command: CmdPut, ActionID: newAction, OutputID: []byte{0x02}, BodySize: int64(len(newPayload))})
 	s2.send(newPayload)
 	s2.recv()
@@ -442,6 +442,47 @@ func TestServe_MixedMethodCarryOver(t *testing.T) {
 	}
 	if methods[uint16(CompressionZstd)] != 1 {
 		t.Fatalf("want 1 zstd entry, got methods=%v", methods)
+	}
+}
+
+func TestServe_TmpDirOverride(t *testing.T) {
+	tmp := t.TempDir()
+	archivePath := filepath.Join(tmp, "cache.zip")
+	customTmp := filepath.Join(tmp, "custom-tmp", "scratch") // intentionally not pre-created
+
+	actionID := []byte{0xa1}
+	outputID := []byte{0xa2}
+	payload := []byte("scratch in custom dir")
+
+	s := newSessionWith(t, archivePath, CompressionDeflate, customTmp)
+	s.send(Request{ID: 1, Command: CmdPut, ActionID: actionID, OutputID: outputID, BodySize: int64(len(payload))})
+	s.send(payload)
+	putResp := s.recv()
+	if !strings.HasPrefix(putResp.DiskPath, customTmp+string(filepath.Separator)) {
+		t.Fatalf("put DiskPath %q not under custom tmp %q", putResp.DiskPath, customTmp)
+	}
+
+	s.send(Request{ID: 2, Command: CmdGet, ActionID: actionID})
+	getResp := s.recv()
+	if getResp.Miss {
+		t.Fatalf("expected hit after put")
+	}
+	if !strings.HasPrefix(getResp.DiskPath, customTmp+string(filepath.Separator)) {
+		t.Fatalf("get DiskPath %q not under custom tmp %q", getResp.DiskPath, customTmp)
+	}
+
+	s.closeAndWait()
+
+	scratchEntries, err := os.ReadDir(customTmp)
+	if err != nil {
+		t.Fatalf("read custom tmp: %v", err)
+	}
+	if len(scratchEntries) != 0 {
+		names := make([]string, 0, len(scratchEntries))
+		for _, e := range scratchEntries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("expected custom tmp to be empty after close, still has: %v", names)
 	}
 }
 
