@@ -1,5 +1,7 @@
 # go-archive-cacheprog
 
+**This software is for technical verification.**
+
 A [`GOCACHEPROG`](https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching) implementation that stores the Go build cache as a single zip archive file.
 
 Because the entire cache lives in one file, it is easy to ship as a CI cache artifact or a container image layer. The archive is a regular zip, so entries can be read with random access — there is no need to expand everything at startup.
