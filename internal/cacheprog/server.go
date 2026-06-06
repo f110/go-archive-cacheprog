@@ -9,18 +9,21 @@ import (
 	"sync"
 )
 
-func Run(ctx context.Context, archivePath string, in io.Reader, out io.Writer) error {
+func Run(ctx context.Context, archivePath string, in io.Reader, out, stats io.Writer) (err error) {
 	cache, err := OpenArchive(archivePath)
 	if err != nil {
 		return fmt.Errorf("failed to open archive %q: %w", archivePath, err)
 	}
+	defer func() {
+		if stats != nil {
+			_ = cache.WriteStats(stats)
+		}
+		if cerr := cache.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
-	serveErr := Serve(ctx, cache, in, out)
-	closeErr := cache.Close()
-	if serveErr != nil {
-		return serveErr
-	}
-	return closeErr
+	return Serve(ctx, cache, in, out)
 }
 
 func Serve(ctx context.Context, cache *ArchiveCache, in io.Reader, out io.Writer) (err error) {

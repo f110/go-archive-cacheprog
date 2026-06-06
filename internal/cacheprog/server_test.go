@@ -10,16 +10,18 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 type session struct {
-	t   *testing.T
-	enc *json.Encoder
-	dec *json.Decoder
-	in  *io.PipeWriter
-	out *io.PipeReader
-	err <-chan error
+	t     *testing.T
+	enc   *json.Encoder
+	dec   *json.Decoder
+	in    *io.PipeWriter
+	out   *io.PipeReader
+	err   <-chan error
+	stats *bytes.Buffer
 }
 
 func newSession(t *testing.T, archivePath string) *session {
@@ -27,20 +29,22 @@ func newSession(t *testing.T, archivePath string) *session {
 
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
+	stats := &bytes.Buffer{}
 	errCh := make(chan error, 1)
 	go func() {
-		err := Run(context.Background(), archivePath, inR, outW)
+		err := Run(context.Background(), archivePath, inR, outW, stats)
 		outW.Close()
 		errCh <- err
 	}()
 
 	s := &session{
-		t:   t,
-		enc: json.NewEncoder(inW),
-		dec: json.NewDecoder(outR),
-		in:  inW,
-		out: outR,
-		err: errCh,
+		t:     t,
+		enc:   json.NewEncoder(inW),
+		dec:   json.NewDecoder(outR),
+		in:    inW,
+		out:   outR,
+		err:   errCh,
+		stats: stats,
 	}
 
 	var handshake Response
@@ -297,6 +301,44 @@ func TestServe_ConcurrentGetsSameActionID(t *testing.T) {
 		}
 	}
 	s.closeAndWait()
+}
+
+func TestServe_StatsOutput(t *testing.T) {
+	tmp := t.TempDir()
+	archivePath := filepath.Join(tmp, "cache.zip")
+
+	actionA := []byte{0xa1}
+	outputA := []byte{0xa2}
+	payloadA := []byte("aaaaaaaaaa")
+
+	populate := newSession(t, archivePath)
+	populate.send(Request{ID: 1, Command: CmdPut, ActionID: actionA, OutputID: outputA, BodySize: int64(len(payloadA))})
+	populate.send(payloadA)
+	populate.recv()
+	populate.closeAndWait()
+
+	if got := populate.stats.String(); !strings.Contains(got, "puts:      1") {
+		t.Fatalf("populate stats missing puts=1: %s", got)
+	}
+
+	s := newSession(t, archivePath)
+	s.send(Request{ID: 1, Command: CmdGet, ActionID: actionA})
+	s.recv()
+	s.send(Request{ID: 2, Command: CmdGet, ActionID: []byte{0xff}})
+	s.recv()
+	s.closeAndWait()
+
+	stats := s.stats.String()
+	for _, want := range []string{
+		"gets:      2 (hits: 1, misses: 1)",
+		"hit rate:  50.0%",
+		"hit bytes: 10 B",
+		"puts:      0",
+	} {
+		if !strings.Contains(stats, want) {
+			t.Fatalf("stats output missing %q:\n%s", want, stats)
+		}
+	}
 }
 
 func TestServe_MissingArchiveCreatesEmptyOnClose(t *testing.T) {

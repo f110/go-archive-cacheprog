@@ -24,7 +24,7 @@ func NewRootCommand() *cobra.Command {
 			if archivePath == "" {
 				return fmt.Errorf("%s is required", archiveEnvVar)
 			}
-			return cacheprog.Run(c.Context(), archivePath, os.Stdin, os.Stdout)
+			return cacheprog.Run(c.Context(), archivePath, os.Stdin, os.Stdout, os.Stderr)
 		},
 	}
 }

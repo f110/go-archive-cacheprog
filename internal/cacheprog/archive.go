@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +39,17 @@ type ArchiveCache struct {
 
 	extractMu sync.Mutex
 	extracts  map[string]*extractOnce
+
+	stats Stats
+}
+
+type Stats struct {
+	Gets     atomic.Int64
+	Hits     atomic.Int64
+	Misses   atomic.Int64
+	HitBytes atomic.Int64
+	Puts     atomic.Int64
+	PutBytes atomic.Int64
 }
 
 type extractOnce struct {
@@ -93,6 +105,21 @@ func OpenArchive(archivePath string) (*ArchiveCache, error) {
 }
 
 func (c *ArchiveCache) Get(actionID []byte) (*Entry, error) {
+	c.stats.Gets.Add(1)
+	entry, err := c.get(actionID)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		c.stats.Misses.Add(1)
+		return nil, nil
+	}
+	c.stats.Hits.Add(1)
+	c.stats.HitBytes.Add(entry.Size)
+	return entry, nil
+}
+
+func (c *ArchiveCache) get(actionID []byte) (*Entry, error) {
 	key := hex.EncodeToString(actionID)
 
 	c.mu.Lock()
@@ -196,7 +223,52 @@ func (c *ArchiveCache) Put(actionID, outputID []byte, size int64, body []byte) (
 	}
 	c.mu.Unlock()
 
+	c.stats.Puts.Add(1)
+	c.stats.PutBytes.Add(size)
+
 	return diskPath, nil
+}
+
+func (c *ArchiveCache) WriteStats(w io.Writer) error {
+	gets := c.stats.Gets.Load()
+	hits := c.stats.Hits.Load()
+	misses := c.stats.Misses.Load()
+	hitBytes := c.stats.HitBytes.Load()
+	puts := c.stats.Puts.Load()
+	putBytes := c.stats.PutBytes.Load()
+
+	var hitRate float64
+	if total := hits + misses; total > 0 {
+		hitRate = float64(hits) / float64(total) * 100
+	}
+
+	_, err := fmt.Fprintf(w,
+		"go-archive-cacheprog: cache stats\n"+
+			"  archive:   %s\n"+
+			"  gets:      %d (hits: %d, misses: %d)\n"+
+			"  hit rate:  %.1f%%\n"+
+			"  hit bytes: %s\n"+
+			"  puts:      %d (%s)\n",
+		c.archivePath,
+		gets, hits, misses,
+		hitRate,
+		humanBytes(hitBytes),
+		puts, humanBytes(putBytes),
+	)
+	return err
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func (c *ArchiveCache) Close() error {
