@@ -40,7 +40,17 @@ type ArchiveCache struct {
 	extractMu sync.Mutex
 	extracts  map[string]*extractOnce
 
-	stats Stats
+	stats      Stats
+	flushStats flushStats
+}
+
+type flushStats struct {
+	written         bool
+	archiveSize     int64
+	totalEntries    int
+	newEntries      int
+	replacedEntries int
+	duration        time.Duration
 }
 
 type Stats struct {
@@ -242,14 +252,32 @@ func (c *ArchiveCache) WriteStats(w io.Writer) error {
 		hitRate = float64(hits) / float64(total) * 100
 	}
 
-	_, err := fmt.Fprintf(w,
+	if _, err := fmt.Fprintf(w,
 		"go-archive-cacheprog: cache stats\n"+
-			"  archive:   %s\n"+
-			"  gets:      %d (hits: %d, misses: %d)\n"+
-			"  hit rate:  %.1f%%\n"+
-			"  hit bytes: %s\n"+
-			"  puts:      %d (%s)\n",
+			"  archive:       %s\n",
 		c.archivePath,
+	); err != nil {
+		return err
+	}
+	if c.flushStats.written {
+		if _, err := fmt.Fprintf(w,
+			"  archive size:  %s\n"+
+				"  entries:       %d total (new: %d, replaced: %d)\n"+
+				"  update time:   %s\n",
+			humanBytes(c.flushStats.archiveSize),
+			c.flushStats.totalEntries,
+			c.flushStats.newEntries,
+			c.flushStats.replacedEntries,
+			c.flushStats.duration.Round(time.Millisecond),
+		); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintf(w,
+		"  gets:          %d (hits: %d, misses: %d)\n"+
+			"  hit rate:      %.1f%%\n"+
+			"  hit bytes:     %s\n"+
+			"  puts:          %d (%s)\n",
 		gets, hits, misses,
 		hitRate,
 		humanBytes(hitBytes),
@@ -306,6 +334,8 @@ func (c *ArchiveCache) Flush() error {
 		return nil
 	}
 
+	start := time.Now()
+
 	archiveDir := filepath.Dir(c.archivePath)
 	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
 		return err
@@ -326,16 +356,19 @@ func (c *ArchiveCache) Flush() error {
 
 	zw := zip.NewWriter(tmpFile)
 
+	var keptCount, replacedCount int
 	if c.zr != nil {
 		for _, f := range c.zr.File {
 			if actionHex, _, ok := strings.Cut(f.Name, "-"); ok {
 				if _, replace := pending[actionHex]; replace {
+					replacedCount++
 					continue
 				}
 			}
 			if err := zw.Copy(f); err != nil {
 				return err
 			}
+			keptCount++
 		}
 	}
 
@@ -370,6 +403,17 @@ func (c *ArchiveCache) Flush() error {
 		return err
 	}
 	committed = true
+
+	c.flushStats = flushStats{
+		written:         true,
+		totalEntries:    keptCount + len(pending),
+		newEntries:      len(pending),
+		replacedEntries: replacedCount,
+		duration:        time.Since(start),
+	}
+	if fi, err := os.Stat(c.archivePath); err == nil {
+		c.flushStats.archiveSize = fi.Size()
+	}
 	return nil
 }
 

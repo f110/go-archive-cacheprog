@@ -317,8 +317,16 @@ func TestServe_StatsOutput(t *testing.T) {
 	populate.recv()
 	populate.closeAndWait()
 
-	if got := populate.stats.String(); !strings.Contains(got, "puts:      1") {
-		t.Fatalf("populate stats missing puts=1: %s", got)
+	populateStats := populate.stats.String()
+	for _, want := range []string{
+		"puts:          1",
+		"entries:       1 total (new: 1, replaced: 0)",
+		"archive size:",
+		"update time:",
+	} {
+		if !strings.Contains(populateStats, want) {
+			t.Fatalf("populate stats missing %q:\n%s", want, populateStats)
+		}
 	}
 
 	s := newSession(t, archivePath)
@@ -330,14 +338,51 @@ func TestServe_StatsOutput(t *testing.T) {
 
 	stats := s.stats.String()
 	for _, want := range []string{
-		"gets:      2 (hits: 1, misses: 1)",
-		"hit rate:  50.0%",
-		"hit bytes: 10 B",
-		"puts:      0",
+		"gets:          2 (hits: 1, misses: 1)",
+		"hit rate:      50.0%",
+		"hit bytes:     10 B",
+		"puts:          0",
 	} {
 		if !strings.Contains(stats, want) {
 			t.Fatalf("stats output missing %q:\n%s", want, stats)
 		}
+	}
+	if strings.Contains(stats, "archive size:") {
+		t.Fatalf("read-only session must not report archive size:\n%s", stats)
+	}
+	if strings.Contains(stats, "entries:") {
+		t.Fatalf("read-only session must not report entries:\n%s", stats)
+	}
+	if strings.Contains(stats, "update time:") {
+		t.Fatalf("read-only session must not report update time:\n%s", stats)
+	}
+}
+
+func TestServe_FlushStatsReplacement(t *testing.T) {
+	tmp := t.TempDir()
+	archivePath := filepath.Join(tmp, "cache.zip")
+
+	actionA := []byte{0xa1}
+	actionB := []byte{0xb2}
+	payload := bytes.Repeat([]byte("x"), 256)
+
+	s1 := newSession(t, archivePath)
+	for i, a := range [][]byte{actionA, actionB} {
+		s1.send(Request{ID: int64(i + 1), Command: CmdPut, ActionID: a, OutputID: []byte{0x01}, BodySize: int64(len(payload))})
+		s1.send(payload)
+		s1.recv()
+	}
+	s1.closeAndWait()
+
+	s2 := newSession(t, archivePath)
+	s2.send(Request{ID: 1, Command: CmdPut, ActionID: actionA, OutputID: []byte{0x02}, BodySize: int64(len(payload))})
+	s2.send(payload)
+	s2.recv()
+	s2.closeAndWait()
+
+	stats := s2.stats.String()
+	if !strings.Contains(stats, "entries:       2 total (new: 1, replaced: 1)") {
+		t.Fatalf("expected entries line with replaced=1:\n%s", stats)
 	}
 }
 
